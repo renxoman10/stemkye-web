@@ -1,0 +1,138 @@
+<!doctype html>
+<!--
+  Stemkye · Custom Web Receiver (Google Cast CAF v3).
+  Reproduce la mezcla enviada por la app y muestra la letra sincronizada con el reloj del propio receptor.
+  Despliegue: alojar por HTTPS, registrar en https://cast.google.com/publish y compilar la app con
+  -Pstemkye.castReceiverAppId=<APP_ID>. Ver docs/export-and-cast.md. No verificado en un dispositivo real.
+-->
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Stemkye Karaoke</title>
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+  <style>
+    :root { --canvas: #0B0F19; --surface: #111827; --cyan: #4CD7F6; --text: #DFE2F1; --dim: rgba(255,255,255,.4); --violet: #D0BCFF; }
+    html, body { margin: 0; height: 100%; background: var(--canvas); color: var(--text); font-family: "Plus Jakarta Sans", sans-serif; overflow: hidden; }
+    cast-media-player { position: absolute; width: 1px; height: 1px; opacity: 0; }
+    .stage { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3vh; padding: 0 8vw; text-align: center;
+             background: radial-gradient(ellipse at center, rgba(139,92,246,.18), transparent 60%), var(--canvas); }
+    .brand { position: absolute; top: 5vh; left: 6vw; font-weight: 700; font-size: 3.2vh; }
+    .brand small { display: block; font-family: "JetBrains Mono", monospace; color: var(--cyan); font-size: 1.8vh; }
+    .prev { font-size: 4vh; color: var(--dim); min-height: 5vh; }
+    .current { font-size: 8vh; font-weight: 700; line-height: 1.1; color: var(--text); }
+    .current .lit { color: var(--cyan); }
+    /* Carácter a medio iluminar: degradado duro recortado al texto, --f = fracción iluminada. */
+    .current .part { background: linear-gradient(90deg, var(--cyan) var(--f), var(--text) var(--f));
+                     -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .next { font-size: 4.4vh; color: #CBC3D7; }
+    .count { display: inline-flex; align-items: center; justify-content: center; width: 5vh; height: 5vh; border: .35vh solid var(--cyan);
+             border-radius: 50%; color: var(--cyan); font-weight: 700; font-size: 3vh; }
+    .next2 { font-size: 3.4vh; color: var(--dim); }
+    .title { position: absolute; bottom: 5vh; font-family: "JetBrains Mono", monospace; font-size: 2vh; color: var(--violet); }
+  </style>
+</head>
+<body>
+  <cast-media-player></cast-media-player>
+  <div class="brand">Stemkye<small>KARAOKE • CAST</small></div>
+  <div class="stage">
+    <div class="prev" id="prev"></div>
+    <div class="current" id="current"><span class="lit" id="lit"></span><span class="part" id="part"></span><span id="rest">♪</span></div>
+    <div class="next" id="next"></div>
+    <div class="next2" id="next2"></div>
+  </div>
+  <div class="title" id="title"></div>
+
+  <script>
+    const NAMESPACE = 'urn:x-cast:com.stemkye.lyrics';
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const player = context.getPlayerManager();
+    let lyrics = { offsetMs: 0, lines: [] };
+
+    // La app envía {type:"lyrics", offsetMs, lines:[{t, e, text}]} (t/e = -1 si no hay inicio/final).
+    context.addCustomMessageListener(NAMESPACE, (event) => {
+      const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+      if (data && data.type === 'lyrics') lyrics = data;
+    });
+
+    player.addEventListener(cast.framework.events.EventType.PLAYER_LOAD_COMPLETE, () => {
+      const meta = player.getMediaInformation()?.metadata;
+      document.getElementById('title').textContent = meta ? [meta.title, meta.artist].filter(Boolean).join(' • ') : '';
+    });
+
+    const el = (id) => document.getElementById(id);
+    const text = (i) => (lyrics.lines[i] && lyrics.lines[i].text) || '';
+
+    // Mismo cálculo que LyricsTimeline.litPosition: el tiempo se reparte entre palabras por longitud y,
+    // dentro del turno de cada palabra, el color la recorre de forma continua (posición con fracción).
+    function litPosition(s, progress) {
+      const words = [...s.matchAll(/\S+/g)];
+      if (!words.length) return 0;
+      const total = words.reduce((n, w) => n + w[0].length, 0);
+      let before = 0;
+      for (const w of words) {
+        const len = w[0].length;
+        if (progress * total < before + len) {
+          return w.index + Math.min(1, Math.max(0, (progress * total - before) / len)) * len;
+        }
+        before += len;
+      }
+      const last = words[words.length - 1];
+      return last.index + last[0].length;
+    }
+
+    // Mismo cálculo que LyricsTimeline.countdown: 3-2-1 antes de la primera línea y tras pausas de más de 10 s.
+    function countdown(t) {
+      let prev = null, next = null;
+      for (const l of lyrics.lines) {
+        if (l.t < 0) continue;
+        if (l.t <= t) prev = l; else if (l.text.trim()) { next = l; break; }
+      }
+      if (!next) return null;
+      const remaining = next.t - t;
+      if (remaining <= 0 || remaining > 3000) return null;
+      if (prev) {
+        const from = prev.text.trim() && prev.e > 0 ? prev.e : prev.t;
+        if (next.t - from <= 10000) return null;
+      }
+      return Math.ceil(remaining / 1000);
+    }
+
+    // Mismo cálculo que LyricsTimeline.cursor en la app, con el reloj del receptor (sin temporizadores propios).
+    function render() {
+      const t = player.getCurrentTimeSec() * 1000 - (lyrics.offsetMs || 0);
+      let active = -1;
+      for (let i = 0; i < lyrics.lines.length; i++) {
+        const start = lyrics.lines[i].t;
+        if (start < 0) continue;
+        if (start <= t) active = i; else break;
+      }
+      let progress = 0;
+      if (active >= 0) {
+        const start = lyrics.lines[active].t;
+        const next = lyrics.lines.slice(active + 1).find((l) => l.t >= 0);
+        const own = lyrics.lines[active].e;
+        const end = own > start ? own : (next ? next.t : start + 4000);
+        progress = Math.min(1, Math.max(0, (t - start) / Math.max(1, end - start)));
+      }
+      const count = countdown(t);
+      if (count) el('prev').innerHTML = '<span class="count">' + count + '</span>';
+      else el('prev').textContent = active > 0 ? text(active - 1) : '';
+      const shown = (active >= 0 ? (text(active) || '♪') : (text(0) || '♪')).toUpperCase();
+      const lit = active >= 0 ? litPosition(shown, progress) : 0;
+      const k = Math.floor(lit);
+      el('lit').textContent = shown.slice(0, k);
+      el('part').textContent = shown.slice(k, k + 1);
+      el('part').style.setProperty('--f', ((lit - k) * 100).toFixed(1) + '%');
+      el('rest').textContent = shown.slice(k + 1);
+      el('next').textContent = text(active >= 0 ? active + 1 : 1);
+      el('next2').textContent = text(active >= 0 ? active + 2 : 2);
+      requestAnimationFrame(render);
+    }
+
+    context.start({ disableIdleTimeout: false });
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>
